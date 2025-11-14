@@ -1,0 +1,51 @@
+# Google Calendar連携設定
+google-calendar:
+  # Google Calendar連携の有効/無効
+  enabled: false
+  # Google Calendar APIキー（必須）
+  # Google Cloud ConsoleからAPIキーを取得して貼り付けてください
+  api-key: YOUR_API_KEY_HERE
+  # カレンダーID
+  # カレンダーIDの取得方法:
+  #   1. Googleカレンダーで対象のカレンダーを開く
+  #   2. 設定 -> カレンダーの設定 -> カレンダーの統合
+  #   3. "カレンダーID" をコピー
+  # 例: "abcd1234@group.calendar.google.com"
+  calendar-id: primary
+  # カレンダーチェック間隔（分）
+  check-interval-minutes: 30
+
+# Discord通知設定
+discord:
+  # DiscordのWebhook URL
+  webhook-url: https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
+  # Discord通知の有効/無効
+  enabled: true
+
+# メンテナンス設定
+maintenance:
+  # メンテナンス中のキックメッセージ
+  kick-message: |-
+    §c§lサーバーメンテナンス中です
+    §e終了までお待ちください
+
+# 通知設定
+notifications:
+  # ログイン時のメンテナンス通知を有効化
+  login-notification: true
+  # メンテナンス前の通知タイミング（分単位）
+  notification-times-minutes:
+    - 360  # 6時間前
+    - 300  # 5時間前
+    - 240  # 4時間前
+    - 180  # 3時間前
+    - 120  # 2時間前
+    - 60   # 1時間前
+    - 30   # 30分前
+    - 20   # 20分前
+    - 10   # 10分前
+    - 5    # 5分前
+    - 3    # 3分前
+    - 1    # 1分前
+  # 30秒前の通知を有効化
+  30-seconds-before: true
