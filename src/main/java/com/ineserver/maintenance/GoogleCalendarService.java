@@ -24,17 +24,17 @@ public class GoogleCalendarService {
 
     private static final String APPLICATION_NAME = "Ineserver Maintenance Plugin";
     private static final JsonFactory JSON_FACTORY = GsonFactory.getDefaultInstance();
-    
+
     private final ConfigManager configManager;
     private final MaintenanceManager maintenanceManager;
     private final Logger logger;
-    
+
     private Calendar calendarService;
     private ScheduledExecutorService scheduler;
     private boolean initialized = false;
 
-    public GoogleCalendarService(ConfigManager configManager, MaintenanceManager maintenanceManager, 
-                                 Logger logger) {
+    public GoogleCalendarService(ConfigManager configManager, MaintenanceManager maintenanceManager,
+            Logger logger) {
         this.configManager = configManager;
         this.maintenanceManager = maintenanceManager;
         this.logger = logger;
@@ -62,7 +62,7 @@ public class GoogleCalendarService {
         try {
             // HTTPトランスポートの構築
             NetHttpTransport httpTransport = GoogleNetHttpTransport.newTrustedTransport();
-            
+
             // Calendar APIサービスの構築（APIキー認証）
             calendarService = new Calendar.Builder(httpTransport, JSON_FACTORY, null)
                     .setApplicationName(APPLICATION_NAME)
@@ -81,16 +81,16 @@ public class GoogleCalendarService {
 
     private void startScheduledCheck() {
         scheduler = Executors.newScheduledThreadPool(1);
-        
+
         int checkIntervalMinutes = configManager.getGoogleCalendarCheckInterval();
-        
+
         // 初回チェック（起動後1分後）
         scheduler.schedule(this::checkCalendarEvents, 1, TimeUnit.MINUTES);
-        
+
         // 定期チェック
-        scheduler.scheduleAtFixedRate(this::checkCalendarEvents, 
+        scheduler.scheduleAtFixedRate(this::checkCalendarEvents,
                 checkIntervalMinutes, checkIntervalMinutes, TimeUnit.MINUTES);
-        
+
         logger.info("Started scheduled calendar check (interval: " + checkIntervalMinutes + " minutes)");
     }
 
@@ -102,15 +102,15 @@ public class GoogleCalendarService {
         try {
             String calendarId = configManager.getGoogleCalendarId();
             String apiKey = configManager.getGoogleCalendarApiKey();
-            
+
             // 現在時刻から未来のイベントを取得
             DateTime now = new DateTime(System.currentTimeMillis());
-            
+
             // 今後30日間のイベントを取得
             DateTime maxTime = new DateTime(System.currentTimeMillis() + (30L * 24 * 60 * 60 * 1000));
-            
+
             Events events = calendarService.events().list(calendarId)
-                    .setKey(apiKey)  // APIキーを設定
+                    .setKey(apiKey) // APIキーを設定
                     .setTimeMin(now)
                     .setTimeMax(maxTime)
                     .setOrderBy("startTime")
@@ -119,66 +119,60 @@ public class GoogleCalendarService {
                     .execute();
 
             java.util.List<Event> items = events.getItems();
-            
+
             if (items.isEmpty()) {
                 logger.debug("No upcoming maintenance events found in calendar");
-                return;
+                // 空のリストで同期（これにより、既存のイベントが全てキャンセルされる可能性があるが、
+                // 30日以内のイベントがないという意味なので、30日以内のものは消えるべき）
             }
+
+            java.util.List<MaintenanceEvent> maintenanceEvents = new java.util.ArrayList<>();
 
             // 全てのイベントを処理
             for (Event event : items) {
-                processCalendarEvent(event);
+                MaintenanceEvent maintenanceEvent = createMaintenanceEvent(event);
+                if (maintenanceEvent != null) {
+                    maintenanceEvents.add(maintenanceEvent);
+                }
             }
+
+            // 同期処理を実行
+            maintenanceManager.syncGoogleCalendarEvents(maintenanceEvents);
 
         } catch (IOException e) {
             logger.error("Failed to fetch calendar events", e);
         }
     }
 
-    private void processCalendarEvent(Event event) {
+    private MaintenanceEvent createMaintenanceEvent(Event event) {
         try {
             String eventId = event.getId();
-            
-            // 既に処理済みのイベントIDを取得
-            Set<String> processedIds = maintenanceManager.getProcessedEventIds();
-            boolean alreadyProcessed = processedIds.contains(eventId);
-
             String summary = event.getSummary();
             String description = event.getDescription() != null ? event.getDescription() : "";
-            
+
             // 開始時刻の取得
             Instant startTime = getInstantFromEventDateTime(event.getStart());
             Instant endTime = getInstantFromEventDateTime(event.getEnd());
-            
+
             if (startTime == null || endTime == null) {
                 logger.warn("Event has invalid date/time: " + summary);
-                return;
+                return null;
             }
 
             Instant now = Instant.now();
-            
+
             // 完全に過去のイベント（終了時刻も過去）はスキップ
             if (endTime.isBefore(now)) {
-                return;
-            }
-            
-            // 既に処理済みで、まだ開始していないイベントはスキップ（重複通知防止）
-            if (alreadyProcessed && startTime.isAfter(now)) {
-                logger.debug("Skipping already processed future event: " + summary);
-                return;
+                return null;
             }
 
-            // メンテナンスイベントとして登録
-            MaintenanceEvent maintenanceEvent = new MaintenanceEvent(
-                    eventId, summary, description, startTime, endTime
-            );
-
-            maintenanceManager.scheduleMaintenanceEvent(maintenanceEvent);
-            
-            logger.info("Scheduled maintenance from Google Calendar: " + summary);
+            // メンテナンスイベントを作成
+            return new MaintenanceEvent(
+                    eventId, summary, description, startTime, endTime);
 
         } catch (Exception e) {
             logger.error("Error processing calendar event", e);
+            return null;
         }
     }
 
@@ -200,8 +194,7 @@ public class GoogleCalendarService {
                     ((int) date.getValue() / 100) % 100,
                     (int) date.getValue() % 100,
                     0, 0, 0, 0,
-                    ZoneId.systemDefault()
-            );
+                    ZoneId.systemDefault());
             return zonedDateTime.toInstant();
         }
 

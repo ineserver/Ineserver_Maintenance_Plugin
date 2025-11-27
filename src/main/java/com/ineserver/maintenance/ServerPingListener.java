@@ -14,7 +14,7 @@ public class ServerPingListener {
         this.maintenanceManager = maintenanceManager;
     }
 
-    @Subscribe
+    @Subscribe(priority = -100)
     public void onServerPing(ProxyPingEvent event) {
         if (!maintenanceManager.isMaintenanceMode()) {
             return;
@@ -29,7 +29,7 @@ public class ServerPingListener {
         builder.description(motd);
 
         // バージョン表記を変更
-        ServerPing.Version version = new ServerPing.Version(0, "§c§lメンテナンス");
+        ServerPing.Version version = new ServerPing.Version(-1, "メンテナンス");
         builder.version(version);
 
         // プレイヤー数を0/0に設定

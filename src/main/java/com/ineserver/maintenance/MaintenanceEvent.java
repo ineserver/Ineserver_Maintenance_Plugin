@@ -37,4 +37,34 @@ public class MaintenanceEvent {
     public Instant getEndTime() {
         return endTime;
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o)
+            return true;
+        if (o == null || getClass() != o.getClass())
+            return false;
+
+        MaintenanceEvent that = (MaintenanceEvent) o;
+
+        if (!id.equals(that.id))
+            return false;
+        if (!title.equals(that.title))
+            return false;
+        if (!description.equals(that.description))
+            return false;
+        if (!startTime.equals(that.startTime))
+            return false;
+        return endTime.equals(that.endTime);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = id.hashCode();
+        result = 31 * result + title.hashCode();
+        result = 31 * result + description.hashCode();
+        result = 31 * result + startTime.hashCode();
+        result = 31 * result + endTime.hashCode();
+        return result;
+    }
 }
