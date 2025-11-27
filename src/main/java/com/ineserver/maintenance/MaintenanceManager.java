@@ -591,9 +591,8 @@ public class MaintenanceManager {
             return;
         }
 
-        Instant now = Instant.now();
-
-        // 1. まず全てのイベントをリストに追加
+        // 手順1: まず全てのイベントをリストに復元する
+        // (これを先にやらないと、保存時にデータが消えるバグが発生します)
         for (MaintenanceEvent event : events) {
             String eventId = event.getId();
 
@@ -607,31 +606,35 @@ public class MaintenanceManager {
             }
         }
 
-        // 2. ソート
-        scheduledMaintenances.sort(Comparator.comparing(MaintenanceEvent::getStartTime));
+        // 手順2: メンテナンスモードの復元判定
+        Instant now = Instant.now();
 
-        // 3. メンテナンス状態の判定とスケジューリング
+        // ★修正点: JSONファイルで maintenanceMode: true だった場合のみ、再開判定を行う
+        if (state.isMaintenanceMode()) {
+            for (MaintenanceEvent event : scheduledMaintenances) {
+                Instant startTime = event.getStartTime();
+
+                // 開始時刻を過ぎていて、かつ現在進行中のイベントを探す
+                if (startTime.isBefore(now)) {
+                    currentMaintenance = event;
+                    maintenanceMode = true;
+                    startMaintenance(false); // 通知なしで再開
+                    break; // 1つ見つけたら終了
+                }
+            }
+        }
+
+        // 手順3: 未来のイベントのスケジュール登録
+        // (メンテナンス中でない、またはメンテナンス中でも未来の予定はスケジュールする)
         for (MaintenanceEvent event : scheduledMaintenances) {
-            Instant startTime = event.getStartTime();
-            Instant endTime = event.getEndTime();
-
-            // 終了したイベントはスキップ（ただしリストには残す）
-            if (endTime.isBefore(now)) {
-                continue;
-            }
-
-            // 現在進行中のイベント
-            if (startTime.isBefore(now) && endTime.isAfter(now)) {
-                currentMaintenance = event;
-                maintenanceMode = true;
-                startMaintenance(false); // 復元時は通知を送らない
-            }
-            // 未来のイベント
-            else if (startTime.isAfter(now)) {
+            if (event.getStartTime().isAfter(now)) {
                 scheduleNotifications(event);
                 scheduleMaintenanceStart(event);
             }
         }
+
+        // ソート
+        scheduledMaintenances.sort(Comparator.comparing(MaintenanceEvent::getStartTime));
     }
 
     private void saveMaintenanceState() {
