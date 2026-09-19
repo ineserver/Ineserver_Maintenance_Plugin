@@ -8,10 +8,12 @@ import net.luckperms.api.LuckPerms;
 import net.luckperms.api.model.user.User;
 import org.slf4j.Logger;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -19,6 +21,8 @@ public class MaintenanceManager {
 
     // メンテナンス中でも接続を許可する権限
     public static final String BYPASS_PERMISSION = "maintenance.bypass";
+
+    private static final ZoneId ZONE = ZoneId.of("Asia/Tokyo");
 
     private final ProxyServer server;
     private final ConfigManager configManager;
@@ -54,14 +58,16 @@ public class MaintenanceManager {
     public void syncGoogleCalendarEvents(List<MaintenanceEvent> fetchedEvents) {
         synchronized (scheduledMaintenances) {
             Set<String> fetchedEventIds = new HashSet<>();
-            Map<String, MaintenanceEvent> fetchedEventsMap = new HashMap<>();
 
             for (MaintenanceEvent event : fetchedEvents) {
                 fetchedEventIds.add(event.getId());
-                fetchedEventsMap.put(event.getId(), event);
             }
 
             boolean stateChanged = false;
+            // 今回の同期で見つかった変化(Discordへはまとめて通知する)
+            List<MaintenanceEvent> newEvents = new ArrayList<>();
+            List<DiscordNotifier.EventUpdate> updatedEvents = new ArrayList<>();
+            List<MaintenanceEvent> cancelledEvents = new ArrayList<>();
 
             // 0. 予定終了時刻を過ぎたまま一度も開始されなかったイベントを削除
             if (removeExpiredEvents()) {
@@ -84,9 +90,7 @@ public class MaintenanceManager {
                     }
 
                     logger.info("Maintenance cancelled (removed from calendar): " + existingEvent.getTitle());
-
-                    // Discord通知 - キャンセル
-                    discordNotifier.sendMaintenanceCancelled(existingEvent);
+                    cancelledEvents.add(existingEvent);
 
                     // 通知・開始スケジュールのキャンセル
                     cancelEventSchedules(existingId);
@@ -130,25 +134,29 @@ public class MaintenanceManager {
 
                 if (existingEvent == null) {
                     // 新規イベント
-                    scheduleMaintenanceEvent(fetchedEvent);
+                    if (registerMaintenanceEvent(fetchedEvent)) {
+                        newEvents.add(fetchedEvent);
+                    }
                     stateChanged = true;
                 } else {
                     // 更新チェック
                     if (!existingEvent.equals(fetchedEvent)) {
                         logger.info(
                                 "Maintenance updated: " + existingEvent.getTitle() + " -> " + fetchedEvent.getTitle());
-
-                        // Discord通知 - 更新
-                        discordNotifier.sendMaintenanceUpdated(existingEvent, fetchedEvent);
+                        updatedEvents.add(new DiscordNotifier.EventUpdate(existingEvent, fetchedEvent));
 
                         // 古いイベントを削除して新しいイベントを追加
                         scheduledMaintenances.remove(existingEvent);
                         scheduledMaintenances.add(fetchedEvent);
 
-                        // 通知・開始スケジュールの再設定（延期前の開始タスクが残らないようにする）
+                        // 延期前の通知・開始タスクが残らないようにする（再設定はDiscord通知の後に行う）
                         cancelEventSchedules(eventId);
-                        scheduleNotifications(fetchedEvent);
-                        scheduleMaintenanceStart(fetchedEvent);
+
+                        // 実施中のメンテナンスであれば、変更後の内容を終了時の通知などに反映する
+                        MaintenanceEvent current = currentMaintenance;
+                        if (maintenanceMode && current != null && current.getId().equals(eventId)) {
+                            currentMaintenance = fetchedEvent;
+                        }
 
                         stateChanged = true;
                     }
@@ -158,68 +166,61 @@ public class MaintenanceManager {
             if (stateChanged) {
                 // 開始時刻でソート
                 scheduledMaintenances.sort(Comparator.comparing(MaintenanceEvent::getStartTime));
+            }
+
+            // 3. Discord通知 - 追加・変更・中止を、変更後の予定一覧とあわせて1つのメッセージで送る
+            // (新規イベントは未通知のものだけ)
+            List<MaintenanceEvent> unnotifiedEvents = newEvents.stream()
+                    .filter(e -> !discordNotificationSentMap.getOrDefault(e.getId(), false))
+                    .toList();
+            if (!unnotifiedEvents.isEmpty() || !updatedEvents.isEmpty() || !cancelledEvents.isEmpty()) {
+                discordNotifier.sendScheduleChanges(unnotifiedEvents, updatedEvents, cancelledEvents,
+                        new ArrayList<>(scheduledMaintenances));
+            }
+            for (MaintenanceEvent event : newEvents) {
+                discordNotificationSentMap.put(event.getId(), true);
+            }
+
+            // 4. 通知・開始のスケジュール設定
+            // (予定の通知より後に行い、開始時刻を過ぎていて即座に開始する場合も「開始」の通知が後に届くようにする)
+            for (MaintenanceEvent event : newEvents) {
+                scheduleNotifications(event);
+                scheduleMaintenanceStart(event);
+            }
+            for (DiscordNotifier.EventUpdate update : updatedEvents) {
+                scheduleNotifications(update.after());
+                scheduleMaintenanceStart(update.after());
+            }
+
+            if (stateChanged) {
                 // 状態保存
                 saveMaintenanceState();
             }
         }
     }
 
-    public boolean scheduleMaintenanceEvent(MaintenanceEvent event) {
+    /**
+     * 新しく取得したイベントを予定に登録する。
+     * Discord通知と、通知・開始のスケジュール設定は呼び出し元で行う。
+     *
+     * @return 登録した場合は true
+     */
+    private boolean registerMaintenanceEvent(MaintenanceEvent event) {
         String eventId = event.getId();
 
-        Instant now = Instant.now();
-        Instant startTime = event.getStartTime();
-        Instant endTime = event.getEndTime();
-
-        // 開始時刻が過去の場合は何もしない(記録もしない)
-        if (startTime.isBefore(now)) {
-            // ただし、現在進行中の場合は更新が必要かもしれない
-            // 終了時刻が未来であれば処理続行
-            if (endTime.isBefore(now)) {
-                return false;
-            }
+        // 予定終了時刻を過ぎたイベントは登録しない
+        if (event.getEndTime().isBefore(Instant.now())) {
+            return false;
         }
 
-        // 既に処理済みのイベントかチェック
+        // 以前の予定が残っていれば置き換える
         if (processedEventIds.contains(eventId)) {
-            // 既存のイベントと同じかチェック
-            synchronized (scheduledMaintenances) {
-                for (MaintenanceEvent e : scheduledMaintenances) {
-                    if (e.getId().equals(eventId)) {
-                        if (e.equals(event)) {
-                            return false; // 変更なし
-                        }
-                        break;
-                    }
-                }
-            }
-            // 既存のイベントを更新
             scheduledMaintenances.removeIf(e -> e.getId().equals(eventId));
             cancelEventSchedules(eventId);
         }
 
         processedEventIds.add(eventId);
         scheduledMaintenances.add(event);
-
-        // 開始時刻でソート
-        scheduledMaintenances.sort(Comparator.comparing(MaintenanceEvent::getStartTime));
-
-        // Discord通知 - メンテナンス決定(未通知の場合のみ)
-        Boolean notificationSent = discordNotificationSentMap.get(eventId);
-        if (notificationSent == null || !notificationSent) {
-            discordNotifier.sendMaintenanceScheduled(event);
-            discordNotificationSentMap.put(eventId, true);
-        }
-
-        // メンテナンス状態を保存
-        saveMaintenanceState();
-
-        // 通知スケジュールの設定
-        scheduleNotifications(event);
-
-        // メンテナンス開始のスケジュール
-        scheduleMaintenanceStart(event);
-
         return true;
     }
 
@@ -305,8 +306,9 @@ public class MaintenanceManager {
     }
 
     private void sendMaintenanceNotification(MaintenanceEvent event, int minutes) {
-        String timeStr = minutes >= 60 ? (minutes / 60) + "時間" : minutes + "分";
-        sendMaintenanceNotification(event, timeStr);
+        // 本来の通知時刻を基準にして、実行の遅れで表示がずれないようにする
+        Instant notificationTime = event.getStartTime().minus(Duration.ofMinutes(minutes));
+        sendMaintenanceNotification(event, formatTimeUntil(event.getStartTime(), notificationTime));
     }
 
     private void sendMaintenanceNotification(MaintenanceEvent event, String timeStr) {
@@ -368,14 +370,12 @@ public class MaintenanceManager {
 
             logger.info("Maintenance mode deactivated");
 
-            // Discord通知 - メンテナンス終了
-            if (currentMaintenance != null) {
-                discordNotifier.sendMaintenanceEnded(currentMaintenance);
-
+            MaintenanceEvent endedEvent = currentMaintenance;
+            if (endedEvent != null) {
                 // 終了したイベントのみを削除
                 // (予定終了前に終了した場合、カレンダーから再取得されても再登録されないよう記録しておく)
-                String eventId = currentMaintenance.getId();
-                completedEvents.put(eventId, currentMaintenance.getStartTime());
+                String eventId = endedEvent.getId();
+                completedEvents.put(eventId, endedEvent.getStartTime());
                 scheduledMaintenances.removeIf(e -> e.getId().equals(eventId));
                 processedEventIds.remove(eventId);
                 discordNotificationSentMap.remove(eventId);
@@ -389,8 +389,13 @@ public class MaintenanceManager {
             // 実施中に予定終了時刻を過ぎた(一度も開始されなかった)メンテナンスを削除
             removeExpiredEvents();
 
-            // 実施中に開始時刻を迎えていたメンテナンスがあれば、続けて開始する
             MaintenanceEvent inProgressEvent = findInProgressEvent();
+
+            // Discord通知 - メンテナンス終了(続けて開始するメンテナンス、なければ次回の予定を添える)
+            discordNotifier.sendMaintenanceEnded(endedEvent,
+                    inProgressEvent != null ? inProgressEvent : getNextMaintenanceEvent());
+
+            // 実施中に開始時刻を迎えていたメンテナンスがあれば、続けて開始する
             if (inProgressEvent != null) {
                 logger.info("Starting next maintenance that is already in progress: " + inProgressEvent.getTitle());
                 currentMaintenance = inProgressEvent;
@@ -531,32 +536,19 @@ public class MaintenanceManager {
             return;
         }
 
-        long now = System.currentTimeMillis();
+        Instant now = Instant.now();
         MaintenanceEvent nextEvent = getNextMaintenanceEvent();
 
-        if (nextEvent != null) {
-            long maintenanceTime = nextEvent.getStartTime().toEpochMilli();
-            long timeUntil = maintenanceTime - now;
+        if (nextEvent != null && nextEvent.getStartTime().isAfter(now)) {
+            String timeStr = formatTimeUntil(nextEvent.getStartTime(), now);
 
-            if (timeUntil > 0) {
-                long minutes = TimeUnit.MILLISECONDS.toMinutes(timeUntil);
-                long hours = TimeUnit.MILLISECONDS.toHours(timeUntil);
+            String message = "§e§l[メンテナンスのお知らせ]\n" +
+                    "§f" + timeStr + "後にメンテナンスが予定されています。\n" +
+                    "§7タイトル: §f" + nextEvent.getTitle() + "\n" +
+                    "§7開始時刻: §f" + formatDateTime(nextEvent.getStartTime());
 
-                String timeStr;
-                if (hours > 0) {
-                    timeStr = hours + "時間" + (minutes % 60) + "分";
-                } else {
-                    timeStr = minutes + "分";
-                }
-
-                String message = "§e§l[メンテナンスのお知らせ]\n" +
-                        "§f" + timeStr + "後にメンテナンスが予定されています。\n" +
-                        "§7タイトル: §f" + nextEvent.getTitle() + "\n" +
-                        "§7開始時刻: §f" + formatDateTime(nextEvent.getStartTime());
-
-                Component component = LegacyComponentSerializer.legacySection().deserialize(message);
-                player.sendMessage(component);
-            }
+            Component component = LegacyComponentSerializer.legacySection().deserialize(message);
+            player.sendMessage(component);
         }
     }
 
@@ -613,8 +605,25 @@ public class MaintenanceManager {
         }
     }
 
+    /**
+     * 開始までの時間を「3日」「5時間」「30分」のように表す。
+     * 24時間以上先は日数、24時間以内は時間、1時間未満は分で表す。
+     */
+    static String formatTimeUntil(Instant startTime, Instant now) {
+        long minutes = Math.round(Duration.between(now, startTime).getSeconds() / 60.0);
+        if (minutes < 60) {
+            return Math.max(minutes, 1) + "分";
+        }
+        if (minutes < 24 * 60) {
+            return Math.round(minutes / 60.0) + "時間";
+        }
+        // 日付の差で数え、一緒に表示する開始日時(日本時間)と食い違わないようにする(例: 土曜23時から見た月曜1時は2日後)
+        long days = ChronoUnit.DAYS.between(now.atZone(ZONE).toLocalDate(), startTime.atZone(ZONE).toLocalDate());
+        return Math.max(days, 1) + "日";
+    }
+
     private String formatDateTime(Instant instant) {
-        ZonedDateTime dateTime = instant.atZone(ZoneId.of("Asia/Tokyo"));
+        ZonedDateTime dateTime = instant.atZone(ZONE);
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy/MM/dd(E) HH:mm", java.util.Locale.JAPANESE);
         return dateTime.format(formatter);
     }
@@ -662,18 +671,7 @@ public class MaintenanceManager {
 
             if (now < startTime) {
                 // メンテナンス開始前
-                long timeUntil = startTime - now;
-                long minutes = TimeUnit.MILLISECONDS.toMinutes(timeUntil);
-                long hours = TimeUnit.MILLISECONDS.toHours(timeUntil);
-                long days = TimeUnit.MILLISECONDS.toDays(timeUntil);
-
-                if (days > 0) {
-                    timeInfo = days + "日" + (hours % 24) + "時間" + (minutes % 60) + "分後";
-                } else if (hours > 0) {
-                    timeInfo = hours + "時間" + (minutes % 60) + "分後";
-                } else {
-                    timeInfo = minutes + "分後";
-                }
+                timeInfo = formatTimeUntil(event.getStartTime(), Instant.ofEpochMilli(now)) + "後";
                 status = "開始予定";
             } else if (now >= startTime && now < endTime) {
                 // スケジュール上の実施期間中
