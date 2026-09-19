@@ -105,6 +105,10 @@
                 <configuration>
                     <source>17</source>
                     <target>17</target>
+                    <!-- velocity-plugin.json を生成する注釈プロセッサ。JDK 23以降は明示しないと実行されない -->
+                    <annotationProcessors>
+                        <annotationProcessor>com.velocitypowered.api.plugin.ap.PluginAnnotationProcessor</annotationProcessor>
+                    </annotationProcessors>
                 </configuration>
             </plugin>
             <plugin>
