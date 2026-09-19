@@ -98,7 +98,6 @@ public class DiscordNotifier {
         String description = String.format(
                 "以下のメンテナンス予定はキャンセルされました。\n\n" +
                         "**タイトル:** %s\n" +
-                        "**タイトル:** %s\n" +
                         "**当初の予定:** %s 〜 %s\n\n" +
                         "📅 **カレンダー:** [Google Calendar](https://calendar.google.com/calendar/u/0?cid=dnFobnRpa2FsOXU1OWE1Ym1hOWphdmNjcWdAZ3JvdXAuY2FsZW5kYXIuZ29vZ2xlLmNvbQ)",
                 event.getTitle(),
@@ -152,6 +151,9 @@ public class DiscordNotifier {
 
         } catch (IOException e) {
             logger.error("Error sending Discord notification", e);
+        } catch (RuntimeException e) {
+            // Webhook URLの形式不正など。通知の失敗でメンテナンス処理が中断されないようにする
+            logger.error("Unexpected error sending Discord notification", e);
         }
     }
 

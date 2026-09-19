@@ -31,6 +31,11 @@ public class PlayerConnectionListener {
 
     @Subscribe
     public void onServerConnect(ServerPostConnectEvent event) {
+        // サーバー間の移動では通知しない（プロキシへの初回接続時のみ）
+        if (event.getPreviousServer() != null) {
+            return;
+        }
+
         // ログイン時のメンテナンス通知
         maintenanceManager.sendLoginNotification(event.getPlayer());
     }

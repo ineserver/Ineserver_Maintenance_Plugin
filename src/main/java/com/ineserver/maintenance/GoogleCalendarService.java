@@ -13,8 +13,9 @@ import org.slf4j.Logger;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.time.Instant;
-import java.time.ZonedDateTime;
+import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -109,16 +110,31 @@ public class GoogleCalendarService {
             // 今後30日間のイベントを取得
             DateTime maxTime = new DateTime(System.currentTimeMillis() + (30L * 24 * 60 * 60 * 1000));
 
-            Events events = calendarService.events().list(calendarId)
-                    .setKey(apiKey) // APIキーを設定
-                    .setTimeMin(now)
-                    .setTimeMax(maxTime)
-                    .setOrderBy("startTime")
-                    .setSingleEvents(true)
-                    .setMaxResults(10)
-                    .execute();
+            // 全ページを取得する(一部しか取得できないと、残りのイベントがキャンセル扱いになるため)
+            java.util.List<Event> items = new java.util.ArrayList<>();
+            String calendarTimeZone = null;
+            String pageToken = null;
+            do {
+                Events events = calendarService.events().list(calendarId)
+                        .setKey(apiKey) // APIキーを設定
+                        .setTimeMin(now)
+                        .setTimeMax(maxTime)
+                        .setOrderBy("startTime")
+                        .setSingleEvents(true)
+                        .setMaxResults(250)
+                        .setPageToken(pageToken)
+                        .execute();
 
-            java.util.List<Event> items = events.getItems();
+                if (events.getItems() != null) {
+                    items.addAll(events.getItems());
+                }
+                if (calendarTimeZone == null) {
+                    calendarTimeZone = events.getTimeZone();
+                }
+                pageToken = events.getNextPageToken();
+            } while (pageToken != null);
+
+            ZoneId zone = resolveZone(calendarTimeZone);
 
             if (items.isEmpty()) {
                 logger.debug("No upcoming maintenance events found in calendar");
@@ -130,7 +146,7 @@ public class GoogleCalendarService {
 
             // 全てのイベントを処理
             for (Event event : items) {
-                MaintenanceEvent maintenanceEvent = createMaintenanceEvent(event);
+                MaintenanceEvent maintenanceEvent = createMaintenanceEvent(event, zone);
                 if (maintenanceEvent != null) {
                     maintenanceEvents.add(maintenanceEvent);
                 }
@@ -141,18 +157,32 @@ public class GoogleCalendarService {
 
         } catch (IOException e) {
             logger.error("Failed to fetch calendar events", e);
+        } catch (RuntimeException e) {
+            // 例外が外に出ると定期チェックが以降実行されなくなるため、ここで捕捉する
+            logger.error("Unexpected error while checking calendar events", e);
         }
     }
 
-    private MaintenanceEvent createMaintenanceEvent(Event event) {
+    private ZoneId resolveZone(String timeZone) {
+        if (timeZone != null) {
+            try {
+                return ZoneId.of(timeZone);
+            } catch (Exception e) {
+                logger.warn("Unknown calendar time zone: " + timeZone);
+            }
+        }
+        return ZoneId.systemDefault();
+    }
+
+    private MaintenanceEvent createMaintenanceEvent(Event event, ZoneId zone) {
         try {
             String eventId = event.getId();
-            String summary = event.getSummary();
+            String summary = event.getSummary() != null ? event.getSummary() : "(タイトルなし)";
             String description = event.getDescription() != null ? event.getDescription() : "";
 
             // 開始時刻の取得
-            Instant startTime = getInstantFromEventDateTime(event.getStart());
-            Instant endTime = getInstantFromEventDateTime(event.getEnd());
+            Instant startTime = getInstantFromEventDateTime(event.getStart(), zone);
+            Instant endTime = getInstantFromEventDateTime(event.getEnd(), zone);
 
             if (startTime == null || endTime == null) {
                 logger.warn("Event has invalid date/time: " + summary);
@@ -176,7 +206,8 @@ public class GoogleCalendarService {
         }
     }
 
-    private Instant getInstantFromEventDateTime(com.google.api.services.calendar.model.EventDateTime eventDateTime) {
+    private Instant getInstantFromEventDateTime(com.google.api.services.calendar.model.EventDateTime eventDateTime,
+            ZoneId zone) {
         if (eventDateTime == null) {
             return null;
         }
@@ -187,15 +218,11 @@ public class GoogleCalendarService {
         }
 
         // 終日イベントの場合
+        // 日付はUTCの0時(エポックミリ秒)として格納されているため、日付部分を取り出してカレンダーのタイムゾーンの0時に変換する
         DateTime date = eventDateTime.getDate();
         if (date != null) {
-            ZonedDateTime zonedDateTime = ZonedDateTime.of(
-                    (int) date.getValue() / 10000,
-                    ((int) date.getValue() / 100) % 100,
-                    (int) date.getValue() % 100,
-                    0, 0, 0, 0,
-                    ZoneId.systemDefault());
-            return zonedDateTime.toInstant();
+            LocalDate localDate = Instant.ofEpochMilli(date.getValue()).atZone(ZoneOffset.UTC).toLocalDate();
+            return localDate.atStartOfDay(zone).toInstant();
         }
 
         return null;

@@ -63,19 +63,27 @@ public class MaintenanceStateManager {
         private boolean maintenanceMode;
         private List<EventData> events;
         private Map<String, Boolean> discordNotificationSentMap;
+        // 終了済みイベント（イベントID -> 開始時刻）
+        private Map<String, String> completedEvents;
 
         public MaintenanceState() {
             this.events = new ArrayList<>();
             this.discordNotificationSentMap = new HashMap<>();
+            this.completedEvents = new HashMap<>();
         }
 
-        public MaintenanceState(boolean maintenanceMode, List<MaintenanceEvent> events, Map<String, Boolean> discordNotificationSentMap) {
+        public MaintenanceState(boolean maintenanceMode, List<MaintenanceEvent> events,
+                Map<String, Boolean> discordNotificationSentMap, Map<String, Instant> completedEvents) {
             this.maintenanceMode = maintenanceMode;
             this.events = new ArrayList<>();
             this.discordNotificationSentMap = new HashMap<>(discordNotificationSentMap);
-            
+            this.completedEvents = new HashMap<>();
+
             for (MaintenanceEvent event : events) {
                 this.events.add(new EventData(event));
+            }
+            for (Map.Entry<String, Instant> entry : completedEvents.entrySet()) {
+                this.completedEvents.put(entry.getKey(), entry.getValue().toString());
             }
         }
 
@@ -93,6 +101,17 @@ public class MaintenanceStateManager {
 
         public Map<String, Boolean> getDiscordNotificationSentMap() {
             return new HashMap<>(discordNotificationSentMap);
+        }
+
+        public Map<String, Instant> getCompletedEvents() {
+            Map<String, Instant> result = new HashMap<>();
+            // 旧バージョンの状態ファイルにはこの項目が存在しない
+            if (completedEvents != null) {
+                for (Map.Entry<String, String> entry : completedEvents.entrySet()) {
+                    result.put(entry.getKey(), Instant.parse(entry.getValue()));
+                }
+            }
+            return result;
         }
 
         private static class EventData {

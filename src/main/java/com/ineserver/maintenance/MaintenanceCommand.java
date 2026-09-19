@@ -37,8 +37,13 @@ public class MaintenanceCommand {
                                 return 0;
                             }
 
-                            maintenanceManager.endMaintenance();
+                            MaintenanceEvent nextEvent = maintenanceManager.endMaintenance();
                             source.sendMessage(Component.text("メンテナンスを終了しました。", NamedTextColor.GREEN));
+                            if (nextEvent != null) {
+                                source.sendMessage(Component.text(
+                                        "予定時間中のメンテナンス「" + nextEvent.getTitle() + "」を続けて開始しました。",
+                                        NamedTextColor.YELLOW));
+                            }
                             return Command.SINGLE_SUCCESS;
                         }))
                 .then(LiteralArgumentBuilder.<CommandSource>literal("status")

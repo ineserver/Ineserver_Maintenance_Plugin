@@ -17,6 +17,9 @@ import java.util.concurrent.*;
 
 public class MaintenanceManager {
 
+    // メンテナンス中でも接続を許可する権限
+    public static final String BYPASS_PERMISSION = "maintenance.bypass";
+
     private final ProxyServer server;
     private final ConfigManager configManager;
     private final DiscordNotifier discordNotifier;
@@ -25,11 +28,14 @@ public class MaintenanceManager {
     private LuckPerms luckPerms;
 
     private final List<MaintenanceEvent> scheduledMaintenances = Collections.synchronizedList(new ArrayList<>());
-    private MaintenanceEvent currentMaintenance;
-    private boolean maintenanceMode = false;
+    private volatile MaintenanceEvent currentMaintenance;
+    private volatile boolean maintenanceMode = false;
     private final Map<String, Boolean> discordNotificationSentMap = new ConcurrentHashMap<>();
     private final Set<String> processedEventIds = ConcurrentHashMap.newKeySet();
+    // 終了済みイベント（イベントID -> 開始時刻）。予定終了前に終了したイベントがカレンダーから再取得されても再登録しない
+    private final Map<String, Instant> completedEvents = new ConcurrentHashMap<>();
     private final Map<String, Map<Integer, ScheduledFuture<?>>> scheduledNotifications = new ConcurrentHashMap<>();
+    private final Map<String, ScheduledFuture<?>> scheduledStartTasks = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
     public MaintenanceManager(ProxyServer server, ConfigManager configManager,
@@ -55,6 +61,13 @@ public class MaintenanceManager {
                 fetchedEventsMap.put(event.getId(), event);
             }
 
+            boolean stateChanged = false;
+
+            // 0. 予定終了時刻を過ぎたまま一度も開始されなかったイベントを削除
+            if (removeExpiredEvents()) {
+                stateChanged = true;
+            }
+
             // 1. 削除されたイベントの検出と処理
             // スケジュール済みだが、今回取得したリストに含まれていないイベントを探す
             Iterator<MaintenanceEvent> iterator = scheduledMaintenances.iterator();
@@ -65,7 +78,7 @@ public class MaintenanceManager {
                 // 既に終了したイベントは対象外（これらは自動的に削除されないため）
                 // ただし、まだ開始していない、または進行中のイベントがカレンダーから消えた場合はキャンセル扱い
                 if (!fetchedEventIds.contains(existingId)) {
-                    // 過去のイベントは無視
+                    // 予定終了後も延長中のメンテナンスは /maintenance end で終了するまで保持する
                     if (existingEvent.getEndTime().isBefore(Instant.now())) {
                         continue;
                     }
@@ -75,13 +88,14 @@ public class MaintenanceManager {
                     // Discord通知 - キャンセル
                     discordNotifier.sendMaintenanceCancelled(existingEvent);
 
-                    // 通知のキャンセル
-                    cancelEventNotifications(existingId);
+                    // 通知・開始スケジュールのキャンセル
+                    cancelEventSchedules(existingId);
 
                     // リストから削除
                     iterator.remove();
                     processedEventIds.remove(existingId);
                     discordNotificationSentMap.remove(existingId);
+                    stateChanged = true;
 
                     // もし現在進行中のメンテナンスだった場合、メンテナンスモードを終了するか検討
                     // (安全のため、自動では終了せず、管理者に任せるか、あるいは終了させるか。ここでは終了させない)
@@ -89,10 +103,24 @@ public class MaintenanceManager {
             }
 
             // 2. 新規・更新イベントの処理
-            boolean stateChanged = false;
+            // カレンダーから取得されなくなった(予定終了時刻を過ぎた・削除された)終了済みイベントの記録を削除
+            if (completedEvents.keySet().removeIf(id -> !fetchedEventIds.contains(id))) {
+                stateChanged = true;
+            }
 
             for (MaintenanceEvent fetchedEvent : fetchedEvents) {
                 String eventId = fetchedEvent.getId();
+
+                // 既に終了したメンテナンスは再登録しない
+                Instant completedStartTime = completedEvents.get(eventId);
+                if (completedStartTime != null) {
+                    if (completedStartTime.equals(fetchedEvent.getStartTime())) {
+                        continue;
+                    }
+                    // 開始時刻が変更された場合は、別日程のメンテナンスとして扱う
+                    completedEvents.remove(eventId);
+                    stateChanged = true;
+                }
 
                 // 既存イベントの検索
                 MaintenanceEvent existingEvent = scheduledMaintenances.stream()
@@ -117,8 +145,8 @@ public class MaintenanceManager {
                         scheduledMaintenances.remove(existingEvent);
                         scheduledMaintenances.add(fetchedEvent);
 
-                        // 通知スケジュールの再設定
-                        cancelEventNotifications(eventId);
+                        // 通知・開始スケジュールの再設定（延期前の開始タスクが残らないようにする）
+                        cancelEventSchedules(eventId);
                         scheduleNotifications(fetchedEvent);
                         scheduleMaintenanceStart(fetchedEvent);
 
@@ -167,6 +195,7 @@ public class MaintenanceManager {
             }
             // 既存のイベントを更新
             scheduledMaintenances.removeIf(e -> e.getId().equals(eventId));
+            cancelEventSchedules(eventId);
         }
 
         processedEventIds.add(eventId);
@@ -236,20 +265,38 @@ public class MaintenanceManager {
     }
 
     private void scheduleMaintenanceStart(MaintenanceEvent event) {
+        String eventId = event.getId();
         long now = System.currentTimeMillis();
         long startTime = event.getStartTime().toEpochMilli();
         long delay = startTime - now;
 
+        // 同じイベントの古い開始タスクが残っていればキャンセル
+        ScheduledFuture<?> previous = scheduledStartTasks.remove(eventId);
+        if (previous != null) {
+            previous.cancel(false);
+        }
+
         if (delay > 0) {
-            String eventId = event.getId();
-            scheduler.schedule(() -> {
-                // 最も早いイベントを現在のメンテナンスとして設定
-                if (!maintenanceMode) {
-                    currentMaintenance = event;
-                    startMaintenance();
+            ScheduledFuture<?> future = scheduler.schedule(() -> {
+                synchronized (scheduledMaintenances) {
+                    // 延期・キャンセルされた古い日程のタスクであれば開始しない
+                    if (!isScheduledAt(event)) {
+                        return;
+                    }
+
+                    // 最も早いイベントを現在のメンテナンスとして設定
+                    // (他のメンテナンスが実施中の場合は、そちらの終了時に開始される)
+                    if (!maintenanceMode) {
+                        currentMaintenance = event;
+                        startMaintenance();
+                    }
                 }
             }, delay, TimeUnit.MILLISECONDS);
-        } else if (delay > -60000) { // 開始時刻から1分以内の場合は即座に開始
+
+            scheduledStartTasks.put(eventId, future);
+        } else if (event.getEndTime().isAfter(Instant.now())) {
+            // 開始時刻を過ぎてから把握した場合(カレンダーの確認が開始後だった・開始時刻にプロキシが停止していた等)でも、
+            // 予定終了前であれば即座に開始する
             if (!maintenanceMode) {
                 currentMaintenance = event;
                 startMaintenance();
@@ -306,41 +353,109 @@ public class MaintenanceManager {
         saveMaintenanceState();
     }
 
-    public void endMaintenance() {
-        if (!maintenanceMode) {
-            return;
-        }
+    /**
+     * 実施中のメンテナンスを終了する。
+     *
+     * @return 予定時間中の次のメンテナンスを続けて開始した場合はそのイベント、それ以外は null
+     */
+    public MaintenanceEvent endMaintenance() {
+        synchronized (scheduledMaintenances) {
+            if (!maintenanceMode) {
+                return null;
+            }
 
-        maintenanceMode = false;
+            maintenanceMode = false;
 
-        logger.info("Maintenance mode deactivated");
+            logger.info("Maintenance mode deactivated");
 
-        // Discord通知 - メンテナンス終了
-        if (currentMaintenance != null) {
-            discordNotifier.sendMaintenanceEnded(currentMaintenance);
+            // Discord通知 - メンテナンス終了
+            if (currentMaintenance != null) {
+                discordNotifier.sendMaintenanceEnded(currentMaintenance);
 
-            // 終了したイベントのみを削除
-            String eventId = currentMaintenance.getId();
-            scheduledMaintenances.removeIf(e -> e.getId().equals(eventId));
-            processedEventIds.remove(eventId);
-            discordNotificationSentMap.remove(eventId);
+                // 終了したイベントのみを削除
+                // (予定終了前に終了した場合、カレンダーから再取得されても再登録されないよう記録しておく)
+                String eventId = currentMaintenance.getId();
+                completedEvents.put(eventId, currentMaintenance.getStartTime());
+                scheduledMaintenances.removeIf(e -> e.getId().equals(eventId));
+                processedEventIds.remove(eventId);
+                discordNotificationSentMap.remove(eventId);
 
-            // 終了したイベントの通知のみをキャンセル
-            cancelEventNotifications(eventId);
+                // 終了したイベントの通知・開始スケジュールのみをキャンセル
+                cancelEventSchedules(eventId);
 
-            currentMaintenance = null;
-        }
+                currentMaintenance = null;
+            }
 
-        // 次のメンテナンスがあるかチェック
-        MaintenanceEvent nextEvent = getNextMaintenanceEvent();
-        if (nextEvent == null && scheduledMaintenances.isEmpty()) {
-            // 次のメンテナンスがない場合のみ、全スケジュールをキャンセルして状態をクリア
-            cancelAllScheduledNotifications();
-            stateManager.clearState();
-        } else {
-            // 次のメンテナンスがある場合は状態を保存
+            // 実施中に予定終了時刻を過ぎた(一度も開始されなかった)メンテナンスを削除
+            removeExpiredEvents();
+
+            // 実施中に開始時刻を迎えていたメンテナンスがあれば、続けて開始する
+            MaintenanceEvent inProgressEvent = findInProgressEvent();
+            if (inProgressEvent != null) {
+                logger.info("Starting next maintenance that is already in progress: " + inProgressEvent.getTitle());
+                currentMaintenance = inProgressEvent;
+                startMaintenance();
+                return inProgressEvent;
+            }
+
+            if (scheduledMaintenances.isEmpty()) {
+                // 次のメンテナンスがない場合は全スケジュールをキャンセル
+                cancelAllScheduledNotifications();
+            }
+
+            // 終了済みイベントの記録を残すため、状態はクリアせず保存する
             saveMaintenanceState();
+            return null;
         }
+    }
+
+    /**
+     * 開始時刻を過ぎていて予定終了時刻前のイベントのうち、最も早いものを返す。
+     */
+    private MaintenanceEvent findInProgressEvent() {
+        Instant now = Instant.now();
+        synchronized (scheduledMaintenances) {
+            return scheduledMaintenances.stream()
+                    .filter(e -> !e.getStartTime().isAfter(now) && e.getEndTime().isAfter(now))
+                    .min(Comparator.comparing(MaintenanceEvent::getStartTime))
+                    .orElse(null);
+        }
+    }
+
+    /**
+     * 予定終了時刻を過ぎたイベントを削除する(実施中のメンテナンスは除く)。
+     * 他のメンテナンスの実施中に予定時間が過ぎ、一度も開始されなかったイベントが残り続けないようにする。
+     *
+     * @return 削除したイベントがあれば true
+     */
+    private boolean removeExpiredEvents() {
+        Instant now = Instant.now();
+        MaintenanceEvent current = currentMaintenance;
+        boolean removed = false;
+
+        synchronized (scheduledMaintenances) {
+            Iterator<MaintenanceEvent> iterator = scheduledMaintenances.iterator();
+            while (iterator.hasNext()) {
+                MaintenanceEvent event = iterator.next();
+                String eventId = event.getId();
+
+                if (event.getEndTime().isAfter(now)) {
+                    continue;
+                }
+                if (maintenanceMode && current != null && current.getId().equals(eventId)) {
+                    continue;
+                }
+
+                logger.info("Removing expired maintenance that was never started: " + event.getTitle());
+                iterator.remove();
+                processedEventIds.remove(eventId);
+                discordNotificationSentMap.remove(eventId);
+                cancelEventSchedules(eventId);
+                removed = true;
+            }
+        }
+
+        return removed;
     }
 
     public boolean isMaintenanceMode() {
@@ -364,6 +479,12 @@ public class MaintenanceManager {
     public boolean isPlayerAllowed(Player player) {
         String username = player.getUsername();
 
+        // maintenance.bypass 権限を持つプレイヤーは許可(LuckPermsのグループ継承も反映される)
+        if (player.hasPermission(BYPASS_PERMISSION)) {
+            return true;
+        }
+
+        // 以下は従来の判定: LuckPermsの admin グループに直接所属しているプレイヤーを許可
         // LuckPermsが必須
         if (luckPerms == null) {
             logger.error("LuckPerms is not available! Cannot check permissions for " + username);
@@ -439,12 +560,17 @@ public class MaintenanceManager {
         }
     }
 
-    private void cancelEventNotifications(String eventId) {
+    private void cancelEventSchedules(String eventId) {
         Map<Integer, ScheduledFuture<?>> eventNotifications = scheduledNotifications.remove(eventId);
         if (eventNotifications != null) {
             for (ScheduledFuture<?> future : eventNotifications.values()) {
                 future.cancel(false);
             }
+        }
+
+        ScheduledFuture<?> startTask = scheduledStartTasks.remove(eventId);
+        if (startTask != null) {
+            startTask.cancel(false);
         }
     }
 
@@ -455,6 +581,23 @@ public class MaintenanceManager {
             }
         }
         scheduledNotifications.clear();
+
+        for (ScheduledFuture<?> startTask : scheduledStartTasks.values()) {
+            startTask.cancel(false);
+        }
+        scheduledStartTasks.clear();
+    }
+
+    /**
+     * 指定したイベントが、同じ開始時刻のまま現在もスケジュールされているかを確認する。
+     * 延期やキャンセルで置き換えられた古いイベントに対しては false を返す。
+     */
+    private boolean isScheduledAt(MaintenanceEvent event) {
+        synchronized (scheduledMaintenances) {
+            return scheduledMaintenances.stream()
+                    .anyMatch(e -> e.getId().equals(event.getId())
+                            && e.getStartTime().equals(event.getStartTime()));
+        }
     }
 
     public void shutdown() {
@@ -587,9 +730,8 @@ public class MaintenanceManager {
         List<MaintenanceEvent> events = state.toEvents();
         Map<String, Boolean> notificationMap = state.getDiscordNotificationSentMap();
 
-        if (events.isEmpty()) {
-            return;
-        }
+        // 終了済みイベントの記録を復元（予定イベントが空でも復元する）
+        completedEvents.putAll(state.getCompletedEvents());
 
         // 手順1: まず全てのイベントをリストに復元する
         // (これを先にやらないと、保存時にデータが消えるバグが発生します)
@@ -606,42 +748,43 @@ public class MaintenanceManager {
             }
         }
 
+        // 開始時刻でソート（手順2で最も早く開始したイベントを選ぶため先に行う）
+        scheduledMaintenances.sort(Comparator.comparing(MaintenanceEvent::getStartTime));
+
         // 手順2: メンテナンスモードの復元判定
         Instant now = Instant.now();
 
-        // ★修正点: JSONファイルで maintenanceMode: true だった場合のみ、再開判定を行う
+        // JSONファイルで maintenanceMode: true だった場合は、メンテナンス中の状態で再開する
         if (state.isMaintenanceMode()) {
-            for (MaintenanceEvent event : scheduledMaintenances) {
-                Instant startTime = event.getStartTime();
-
-                // 開始時刻を過ぎていて、かつ現在進行中のイベントを探す
-                if (startTime.isBefore(now)) {
-                    currentMaintenance = event;
-                    maintenanceMode = true;
-                    startMaintenance(false); // 通知なしで再開
-                    break; // 1つ見つけたら終了
-                }
-            }
+            // 開始時刻を過ぎたイベントのうち最も早いものを実施中のメンテナンスとする
+            currentMaintenance = scheduledMaintenances.stream()
+                    .filter(e -> !e.getStartTime().isAfter(now))
+                    .findFirst()
+                    .orElse(null);
+            // 該当イベントがない場合(実施中にカレンダーから削除された等)もメンテナンスモードは維持する
+            startMaintenance(false); // 通知なしで再開
         }
 
-        // 手順3: 未来のイベントのスケジュール登録
-        // (メンテナンス中でない、またはメンテナンス中でも未来の予定はスケジュールする)
-        for (MaintenanceEvent event : scheduledMaintenances) {
-            if (event.getStartTime().isAfter(now)) {
-                scheduleNotifications(event);
-                scheduleMaintenanceStart(event);
-            }
+        // 停止中に予定終了時刻を過ぎたイベントを削除
+        removeExpiredEvents();
+
+        // 手順3: 通知・開始のスケジュール登録
+        // (停止中に開始時刻を過ぎ、まだ予定終了前のイベントは即座に開始される)
+        for (MaintenanceEvent event : new ArrayList<>(scheduledMaintenances)) {
+            scheduleNotifications(event);
+            scheduleMaintenanceStart(event);
         }
 
-        // ソート
-        scheduledMaintenances.sort(Comparator.comparing(MaintenanceEvent::getStartTime));
+        // 復元時の削除・開始を反映して保存
+        saveMaintenanceState();
     }
 
     private void saveMaintenanceState() {
         MaintenanceStateManager.MaintenanceState state = new MaintenanceStateManager.MaintenanceState(
                 maintenanceMode,
                 new ArrayList<>(scheduledMaintenances),
-                new HashMap<>(discordNotificationSentMap));
+                new HashMap<>(discordNotificationSentMap),
+                new HashMap<>(completedEvents));
         stateManager.saveState(state);
     }
 

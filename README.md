@@ -4,7 +4,7 @@ Velocity用の自動メンテナンス管理プラグインです。Googleカレ
 
 注意：サーバー起動後 check-interval-minutes に記載された時間が立たないと最初の確認を行いません。
 
-必須プラグイン：LuckPerms（グループ名：Adminに接続が許可されます）
+必須プラグイン：LuckPerms（maintenance.bypass 権限を持つプレイヤー、または admin グループに直接所属しているプレイヤーはメンテナンス中も接続できます）
 
 動作環境：Velocity
 
@@ -16,3 +16,5 @@ Velocity用の自動メンテナンス管理プラグインです。Googleカレ
 
 ## 権限
 maintenance.notice.off ： すべての通知を表示しない
+
+maintenance.bypass ： メンテナンス中でも接続できる（例：`/lpv group admin permission set maintenance.bypass true`）

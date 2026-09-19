@@ -12,8 +12,9 @@ public class MaintenanceEvent {
 
     public MaintenanceEvent(String id, String title, String description, Instant startTime, Instant endTime) {
         this.id = id;
-        this.title = title;
-        this.description = description;
+        // 件名・説明のない予定でも比較や表示で落ちないよう、nullは空文字にする
+        this.title = title != null ? title : "";
+        this.description = description != null ? description : "";
         this.startTime = startTime;
         this.endTime = endTime;
     }
